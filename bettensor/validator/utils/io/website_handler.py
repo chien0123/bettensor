@@ -162,7 +162,10 @@ class WebsiteHandler:
                                 "wager": prediction.get("wager"),
                                 "modelName": prediction.get("model_name"),
                                 "predictionOdds": prediction.get("predicted_odds"),
-                                "metaData": json.dumps(metadata),
+                                "metaData": json.dumps(
+                                    metadata,
+                                    default=lambda x: x.decode('utf-8') if isinstance(x, bytes) else x
+                                ),
                             }
 
                             transformed_data.append(transformed_prediction)
