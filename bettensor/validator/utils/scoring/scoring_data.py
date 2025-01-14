@@ -486,12 +486,13 @@ class ScoringData:
             tier_column_names = ['tier', 'miner_uid']
             for miner_uid, current_tier in tiers_dict.items():
                 if miner_uid < 256:  # Only update valid UIDs
-                    tier_updates.append((int(current_tier - 1), miner_uid))
+                    # Add 1 to tier value to match internal tier indexing
+                    tier_updates.append((int(current_tier + 1), int(miner_uid)))
             
             await self.db_manager.executemany(
                 """UPDATE miner_stats
-                   SET miner_current_tier = ?
-                   WHERE miner_uid = ?""",
+                   SET miner_current_tier = CAST(:tier AS INTEGER)
+                   WHERE miner_uid = CAST(:miner_uid AS INTEGER)""",
                 tier_updates,
                 column_names=tier_column_names
             )
@@ -733,7 +734,7 @@ class ScoringData:
                 return {}
             tiers = self.tiers[:, current_day]
             bt.logging.debug(f"Tiers: {tiers}")
-            return {miner_uid: tier for miner_uid, tier in enumerate(tiers)}
+            return {int(miner_uid): int(tier - 1) for miner_uid, tier in enumerate(tiers)}
         except Exception as e:
             bt.logging.error(f"Error in get_current_tiers: {str(e)}")
             return {}

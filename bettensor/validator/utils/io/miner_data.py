@@ -343,18 +343,23 @@ class MinerDataMixin:
             for key, value in miner_stats.items():
                 if isinstance(value, bytes):
                     try:
-                        # Try to decode bytes to int first
                         value = int.from_bytes(value, byteorder='little')
                     except (ValueError, TypeError):
                         try:
-                            # If that fails, try to decode as string
                             value = value.decode('utf-8')
                         except UnicodeDecodeError:
-                            # If all else fails, use a default value
                             value = 0
                 
                 # Convert the value to string, handling special cases
                 if key == 'miner_current_tier':
+                    # Handle string representation of bytes
+                    if isinstance(value, str) and value.startswith('\\x'):
+                        try:
+                            # Convert string representation of bytes to actual bytes
+                            value = bytes.fromhex(value[2:].replace('\\x', ''))
+                            value = int.from_bytes(value, byteorder='little')
+                        except (ValueError, TypeError):
+                            value = 1
                     # Ensure tier is a valid integer string
                     try:
                         value = str(int(value)) if value is not None else "1"

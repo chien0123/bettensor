@@ -5,6 +5,7 @@ import sys
 import time
 import copy
 import traceback
+import signal
 import torch
 import sqlite3
 import bittensor as bt
@@ -40,7 +41,12 @@ METAGRAPH_TIMEOUT = 120  # 2 minutes
 QUERY_TIMEOUT = 600  # 10 minutes
 WEBSITE_TIMEOUT = 60  # 1 minute
 SCORING_TIMEOUT = 300  # 5 minutes
-WEIGHTS_TIMEOUT = 180  # 3 minutes
+WEIGHTS_TIMEOUT = 300  # 5 minutes
+DATABASE_MIN_TIMEOUT = 30  # Minimum timeout (30 seconds)
+DATABASE_MAX_TIMEOUT = 120  # Maximum timeout (2 minutes)
+DATABASE_TIMEOUT_BACKOFF = 1.5  # Multiply timeout by this factor on failure
+DATABASE_TIMEOUT_REDUCTION = 0.8  # Multiply by this on success
+DATABASE_TIMEOUT = 30  # 30 seconds timeout for database operations
 
 # At the top of the file, define the timeouts
 TASK_TIMEOUTS = {
@@ -53,6 +59,9 @@ TASK_TIMEOUTS = {
     'check_hotkeys': 60,  # 1 minute
     'state_sync': 300,  # 5 minutes
 }
+
+# At the top with other globals
+_validator = None  # Global validator instance
 
 def cancellable_task(func):
     """
@@ -574,27 +583,39 @@ async def log_status_with_watchdog(validator):
 @cancellable_task
 async def update_game_data(validator, current_time, deep_query=False):
     """
-    Calls SportsData to update game data in the database
-    
-    Args:
-        validator: The validator instance
-        current_time: Current UTC datetime
-        deep_query: If True, queries last 48 hours but doesn't update last_api_call
+    Calls SportsData to update game data in the database with dynamic timeouts
     """
     bt.logging.info("\n--------------------------------Updating game data--------------------------------\n")
     
     try:
         async with async_timeout.timeout(GAME_DATA_TIMEOUT):
-            if not await validator.db_manager.ensure_connection():
-                bt.logging.error("Failed to establish database connection")
-                return
-                
-            api_call_time = current_time
-            query_time = current_time - timedelta(days=2) if deep_query else validator.last_api_call
+            current_timeout = DATABASE_MIN_TIMEOUT
+            max_retries = 3
             
-            bt.logging.info(f"{'Deep query' if deep_query else 'Regular query'} from {query_time} to {current_time}")
-            
-            all_games = await validator.sports_data.fetch_and_update_game_data(query_time)
+            for attempt in range(max_retries):
+                try:
+                    bt.logging.debug(f"Database operation attempt {attempt + 1} with timeout {current_timeout}s")
+                    async with async_timeout.timeout(current_timeout):
+                        if not await validator.db_manager.ensure_connection():
+                            bt.logging.error("Failed to establish database connection")
+                            return
+                        
+                        api_call_time = current_time
+                        query_time = current_time - timedelta(days=2) if deep_query else validator.last_api_call
+                        
+                        bt.logging.info(f"{'Deep query' if deep_query else 'Regular query'} from {query_time} to {current_time}")
+                        all_games = await validator.sports_data.fetch_and_update_game_data(query_time)
+                        
+                        # Success - reduce timeout for next time
+                        current_timeout = max(DATABASE_MIN_TIMEOUT, current_timeout * DATABASE_TIMEOUT_REDUCTION)
+                        break
+                        
+                except asyncio.TimeoutError:
+                    bt.logging.warning(f"Database operation timed out after {current_timeout}s")
+                    current_timeout = min(DATABASE_MAX_TIMEOUT, current_timeout * DATABASE_TIMEOUT_BACKOFF)
+                    if attempt == max_retries - 1:
+                        raise
+                    continue
             
             # Only update last_api_call for regular queries
             if not deep_query:
@@ -612,6 +633,34 @@ async def update_game_data(validator, current_time, deep_query=False):
     except Exception as e:
         bt.logging.error(f"Error in game data update: {str(e)}")
         raise
+
+# Add a new method to handle database cleanup with timeout
+async def cleanup_database_connections(validator):
+    """Cleanup database connections with timeout"""
+    try:
+        async with async_timeout.timeout(DATABASE_TIMEOUT):
+            await validator.db_manager.cleanup()
+    except asyncio.TimeoutError:
+        bt.logging.error("Database cleanup timed out")
+    except Exception as e:
+        bt.logging.error(f"Error during database cleanup: {str(e)}")
+
+# Modify the signal handler to use the new cleanup method
+def signal_handler(signum, frame):
+    global _validator
+    signal_name = signal.strsignal(signum) if hasattr(signal, 'strsignal') else str(signum)
+    bt.logging.info(f"Received signal {signum} ({signal_name}). Shutting down gracefully...")
+    
+    if _validator:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
+        loop.run_until_complete(cleanup_database_connections(_validator))
+        loop.run_until_complete(_validator.cleanup())
+    sys.exit(0)
 
 @time_task("sync_metagraph")
 @cancellable_task
@@ -893,10 +942,14 @@ async def set_weights(validator, weights_to_set):
             validator.weight_setter.set_weights,
             weights_to_set
         )
-        validator.last_set_weights_block = validator.subtensor.block
+        bt.logging.info(f"Set weights result: {result}")
+        if result is True:
+            validator.last_set_weights_block = validator.subtensor.block
+        else:
+            validator.last_set_weights_block = validator.subtensor.block - 250 # Set weights block to 250 blocks ago, to prevent spamming the network with failed weight sets
         return result
     except Exception as e:
-        validator.last_set_weights_block = validator.subtensor.block - 50 # Set weights block to 50 blocks ago, to prevent spamming the network with failed weight sets
+        validator.last_set_weights_block = validator.subtensor.block - 250 # Set weights block to 250 blocks ago, to prevent spamming the network with failed weight sets
         bt.logging.error(f"Error in set_weights wrapper: {str(e)}")
         bt.logging.error(traceback.format_exc())
         return False
@@ -958,42 +1011,20 @@ def cleanup_pycache():
 # The main function parses the configuration and runs the validator.
 async def main():
     """Main function for running the validator."""
-    # Add cleanup at the start of main
+    global _validator
     cleanup_pycache()
     
-    validator = None
-
-    def signal_handler(signum, frame):
-        bt.logging.info(f"Received signal {signum}. Shutting down gracefully...")
-        if validator:
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-            
-            loop.run_until_complete(validator.cleanup())
-        sys.exit(0)
-
-    # Register signal handlers
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
     try:
-        # Create validator instance with config
-        validator = await BettensorValidator.create()
-        
-        # Run the validator
-        await run(validator)
-        
+        _validator = await BettensorValidator.create()
+        await run(_validator)
     except Exception as e:
         bt.logging.error(f"Error in validator: {str(e)}")
-        if validator:
-            await validator.cleanup()
+        if _validator:
+            await _validator.cleanup()
         raise
     finally:
-        if validator:
-            await validator.cleanup()
+        if _validator:
+            await _validator.cleanup()
 
 if __name__ == "__main__":
     try:
