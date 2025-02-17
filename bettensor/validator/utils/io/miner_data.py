@@ -394,8 +394,8 @@ class MinerDataMixin:
 
         bt.logging.info(f"Sending confirmation synapse to miner {miner_uid}, axon: {axon}")
         try:
-            # Ensure all parameters are properly set for the query
-            response = self.dendrite.query(
+            # Use the forward method directly instead of query to avoid event loop conflicts
+            response = await self.dendrite.forward(
                 axons=axon,
                 synapse=synapse,
                 timeout=self.timeout,
