@@ -33,6 +33,7 @@ from bettensor.validator.utils.io.base_api_client import BaseAPIClient
 from bettensor.validator.utils.scoring.watchdog import Watchdog
 from bettensor import __spec_version__
 from types import SimpleNamespace
+import configparser
 
 DEFAULT_DB_PATH = "./bettensor/validator/state/validator.db"
 
@@ -272,15 +273,41 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
         # Initialize MinerDataMixin with required parameters
         MinerDataMixin.__init__(self, self.db_manager, self.metagraph, set(self.metagraph.uids))
 
-        # Initialize the scoring system
+        # Read force_rebuild_scores from setup.cfg
+        config_parser = configparser.ConfigParser()
+        try:
+            config_parser.read('setup.cfg')
+            force_rebuild = config_parser.getboolean('metadata', 'force_rebuild_scores', fallback=False)
+            bt.logging.info(f"Force rebuild scores setting: {force_rebuild}")
+        except configparser.Error as e:
+            bt.logging.error(f"Error reading force_rebuild_scores from setup.cfg: {e}")
+            force_rebuild = False
+
+        # Create a MinerDataMixin instance for the scoring system
+        scoring_miner_data = MinerDataMixin(self.db_manager, self.metagraph, set(self.metagraph.uids))
+
+        # Initialize the scoring system with force_rebuild setting and miner_data
         self.scoring_system = ScoringSystem(
             self.db_manager,
             num_miners=256,
             max_days=45,
-            reference_date=datetime.now(timezone.utc).date(),
-            validator=self,
+            current_date=datetime.now(timezone.utc),
+            force_rebuild=force_rebuild
         )
+        # Set the validator and miner_data attributes
+        self.scoring_system.set_validator(self)
+        self.scoring_system.miner_data = scoring_miner_data
         await self.scoring_system.initialize()
+
+        # After initialization, set force_rebuild_scores back to False to prevent future automatic rebuilds
+        if force_rebuild:
+            try:
+                config_parser.set('metadata', 'force_rebuild_scores', 'False')
+                with open('setup.cfg', 'w') as f:
+                    config_parser.write(f)
+                bt.logging.info("Reset force_rebuild_scores to False after initialization")
+            except Exception as e:
+                bt.logging.error(f"Error resetting force_rebuild_scores in setup.cfg: {e}")
 
         # Setup Validator Components
         self.api_client = BettensorAPIClient(self.db_manager)
