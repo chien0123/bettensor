@@ -203,10 +203,10 @@ class ScoringSystem:
         # tier score is calculated as a rolling average over the scoring window of that tier. every miner gets a tier score for every tier
 
         # Scoring weights
-        self.clv_weight = 0.25
-        self.roi_weight = 0.25
-        self.sortino_weight = 0.25
-        self.entropy_weight = 0.25
+        self.clv_weight = 0.3
+        self.roi_weight = 0.3
+        self.sortino_weight = 0.3
+        self.entropy_weight = 0.1
         self.entropy_window = self.max_days
 
 
