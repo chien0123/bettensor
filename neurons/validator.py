@@ -925,6 +925,7 @@ async def scoring_run(validator, current_time):
                 bt.logging.trace(
                     f"Set score for not queried UID: {uid}. New score: {validator.scores[uid]}"
                 )
+        await validator.save_state()
 
     except Exception as e:
         bt.logging.error(f"Error in scoring_run: {str(e)}")

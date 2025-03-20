@@ -41,29 +41,35 @@ class ScoringSystem:
         max_days: int = 45,
         current_date: Optional[datetime] = None,
         force_rebuild: bool = False,
+        min_stake_service = None,
     ):
-        """Initialize the scoring system.
-
-        Args:
-            db_manager (DatabaseManager): Database manager instance
-            num_miners (int, optional): Number of miners to track. Defaults to 256.
-            max_days (int, optional): Number of days to track. Defaults to 45.
-            current_date (Optional[datetime], optional): Current date to use. Defaults to None.
-            force_rebuild (bool, optional): Whether to force rebuild scores. Defaults to False.
         """
+        Initialize the ScoringSystem.
+        
+        Args:
+            db_manager: Database manager instance for executing queries
+            num_miners (int): Number of miners in the system
+            max_days (int, optional): Maximum number of days to track. Defaults to 45.
+            current_date (datetime, optional): Current date to use. Defaults to None (uses current UTC date).
+            force_rebuild (bool, optional): Whether to force a rebuild of historical scores. Defaults to False.
+            min_stake_service (optional): Service for checking minimum stake requirements. Defaults to None.
+        """
+        # Common attributes
         self.db_manager = db_manager
         self.num_miners = num_miners
         self.max_days = max_days
         self.force_rebuild = force_rebuild
-        self.validator = None  # Initialize validator as None
-        self.miner_data = None  # Initialize miner_data as None
-
+        self.validator = None
+        self.miner_data = None
+        self.min_stake_service = min_stake_service  # Ensure this is set
+        
         # Set current date
         if current_date is None:
             current_date = datetime.now(timezone.utc)
         self.current_date = current_date.replace(
             hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc
         )
+        self.current_day = self.current_date.timetuple().tm_yday % self.max_days
 
         # Initialize arrays
         self.clv_scores = np.zeros((num_miners, max_days), dtype=np.float32)
@@ -75,66 +81,24 @@ class ScoringSystem:
         self.tiers = np.ones((num_miners, max_days), dtype=np.int32)
 
         # Scoring weights
-        self.clv_weight = 0.25
-        self.roi_weight = 0.25
-        self.sortino_weight = 0.25
-        self.entropy_weight = 0.25
+        self.clv_weight = 0.3
+        self.roi_weight = 0.3
+        self.sortino_weight = 0.3
+        self.entropy_weight = 0.1
         self.entropy_window = self.max_days
 
+        # Additional attributes from both init methods
         self.entropy_system = EntropySystem(num_miners, max_days, db_manager=db_manager)
         self.incentives = []
-
-        self.last_update_date = None  # Will store the last day processed as a date object (no time)
-        self.scoring_data = None  # Initialize scoring_data as None
-
-    def set_validator(self, validator):
-        """Set the validator instance and initialize ScoringData."""
-        self.validator = validator
-        self.scoring_data = ScoringData(self)
-
-    def __init__(
-        self,
-        db_manager: DatabaseManager,
-        num_miners: int = 256,
-        max_days: int = 45,
-        current_date: Optional[datetime] = None,
-        force_rebuild: bool = False,
-    ):
-        """
-        Initialize the ScoringSystem.
+        self.last_update_date = None
+        self.scoring_data = None
         
-        Args:
-            db_manager: Database manager instance for executing queries
-            num_miners (int): Number of miners in the system
-            max_days (int, optional): Maximum number of days to track. Defaults to 45.
-            current_date (datetime, optional): Current date to use. Defaults to None (uses current UTC date).
-            force_rebuild (bool, optional): Whether to force a rebuild of historical scores. Defaults to False.
-        """
-        self.db_manager = db_manager
-        self.num_miners = num_miners
-        self.max_days = max_days
-        self.force_rebuild = force_rebuild
-        
-        # Initialize the current date and day index
-        self.current_date = current_date or datetime.now(timezone.utc)
-        self.current_day = self.current_date.timetuple().tm_yday % self.max_days
-
-        #numpy max integer
-        max_int = np.iinfo(np.int64).max
-        np.set_printoptions(threshold=max_int)
-        self.num_miners = num_miners
-        self.max_days = max_days
-        self.num_tiers = (
-            7  # 5 tiers + 2 for invalid UIDs (0) and empty network slots (-1)
-        )
-        self.valid_uids = set()  # Initialize as an empty set
-        self.validator = None
-        self.reference_date = datetime(
-            year=2024, month=9, day=30, tzinfo=timezone.utc
-        )
+        self.num_tiers = 7  # 5 tiers + 2 for invalid UIDs (0) and empty network slots (-1)
+        self.valid_uids = set()
+        self.reference_date = datetime(year=2024, month=9, day=30, tzinfo=timezone.utc)
         self.invalid_uids = []
         self.epsilon = 1e-8  # Small constant to prevent division by zero
-        
+
         # Initialize tier configurations
         self.tier_configs = [
             {
@@ -181,6 +145,7 @@ class ScoringSystem:
             },  # Tier 5
         ]
         
+        # Map tier indices to names
         self.tier_mapping = {
             0: "daily",  # Daily score
             1: "tier_1",
@@ -190,37 +155,15 @@ class ScoringSystem:
             5: "tier_5"
         }
 
-        # Initialize score arrays
-        self.clv_scores = np.zeros((num_miners, max_days), dtype=np.float32)
-        self.roi_scores = np.zeros((num_miners, max_days), dtype=np.float32)
-        self.sortino_scores = np.zeros((num_miners, max_days), dtype=np.float32)
-        self.entropy_scores = np.zeros((num_miners, max_days), dtype=np.float32)
-        self.composite_scores = np.zeros((num_miners, max_days, 6), dtype=np.float32)  # 6 = daily + 5 tiers
-        self.amount_wagered = np.zeros((num_miners, max_days), dtype=np.float32)
-        self.tiers = np.ones((num_miners, max_days), dtype=np.int32)
+        # numpy max integer setting
+        max_int = np.iinfo(np.int64).max
+        np.set_printoptions(threshold=max_int)
 
-        # Initialize composite scores. The last dimension is for a daily score [0], and the other 5 are a "tier score"
-        # tier score is calculated as a rolling average over the scoring window of that tier. every miner gets a tier score for every tier
-
-        # Scoring weights
-        self.clv_weight = 0.3
-        self.roi_weight = 0.3
-        self.sortino_weight = 0.3
-        self.entropy_weight = 0.1
-        self.entropy_window = self.max_days
-
-
-
-        
-        self.entropy_system = EntropySystem(num_miners, max_days, db_manager=db_manager)
-        self.incentives = []
-
-        self.last_update_date = None  # Will store the last day processed as a date object (no time)
-
+    def set_validator(self, validator):
+        """Set the validator instance and initialize ScoringData."""
+        self.validator = validator
         self.scoring_data = ScoringData(self)
-
-
-
+        
     async def populate_amount_wagered(self):
         """Populate the amount_wagered array from raw prediction data."""
         bt.logging.info("Populating amount_wagered from prediction data...")
@@ -827,8 +770,38 @@ class ScoringSystem:
             day = self.current_day
 
         try:
-            day = self._get_day_index(day)
-            bt.logging.debug(f"Calculating weights for day {day}")
+            current_tiers = self.tiers[:, day]
+            # Check for any wager in the last 7 days to determine active miners
+            recent_start_idx = max(0, day - 7 + 1)
+            recent_wagers = np.sum(self.amount_wagered[:, recent_start_idx:day + 1], axis=1)
+            has_predictions = recent_wagers > 0
+            
+            # Get miners meeting minimum stake requirement if service is available
+            meets_min_stake = np.ones(self.num_miners, dtype=bool)
+            if self.min_stake_service is not None:
+                bt.logging.info("Applying minimum stake requirement for weights")
+                min_stake_list = self.min_stake_service.get_min_stake_for_all_uids()
+                if len(min_stake_list) == self.num_miners:
+                    meets_min_stake = np.array(min_stake_list)
+                    bt.logging.info(f"Miners meeting minimum stake: {np.sum(meets_min_stake)}/{self.num_miners}")
+                    
+                    # Log detailed breakdown by tier
+                    current_tiers = self.tiers[:, day]
+                    for tier in range(1, self.num_tiers):
+                        tier_miners = np.where(current_tiers == tier)[0]
+                        if len(tier_miners) > 0:
+                            meet_stake_in_tier = np.sum(meets_min_stake[tier_miners])
+                            bt.logging.info(f"Tier {tier}: {meet_stake_in_tier}/{len(tier_miners)} miners meet min stake")
+                else:
+                    bt.logging.warning(f"Min stake list length ({len(min_stake_list)}) doesn't match num_miners ({self.num_miners}). Skipping min stake check.")
+            
+            valid_miners = np.array(list(set(range(self.num_miners)) - self.invalid_uids))
+            valid_miners = valid_miners[
+                (current_tiers[valid_miners] >= 2) &  # Tier 1+ only
+                (current_tiers[valid_miners] < self.num_tiers) &
+                has_predictions[valid_miners] &
+                meets_min_stake[valid_miners]  # Add min stake requirement
+            ]
             
             # Setup weights array with zeros
             weights = np.zeros(self.num_miners)
@@ -932,6 +905,18 @@ class ScoringSystem:
             # Apply penalties for invalid UIDs
             if hasattr(self, 'invalid_uids') and self.invalid_uids:
                 weights[list(self.invalid_uids)] = 0
+            
+            # Apply penalties for miners not meeting min stake requirements
+            if self.min_stake_service is not None:
+                for miner in range(self.num_miners):
+                    if not meets_min_stake[miner]:
+                        if weights[miner] > 0:
+                            bt.logging.info(f"Zeroing weight for miner {miner} due to insufficient stake")
+                            weights[miner] = 0
+                
+                # Log how many miners got zeroed due to min stake
+                zeroed_count = self.num_miners - np.sum(meets_min_stake)
+                bt.logging.info(f"Zeroed weights for {zeroed_count} miners due to insufficient stake")
             
             # Renormalize after applying penalties
             if np.sum(weights) > 0:
@@ -1122,6 +1107,7 @@ class ScoringSystem:
             if len(weights) != 256:
                 bt.logging.error(f"Weights are not length 256. They are length {len(weights)}")
                 return None
+            self.validator.scores = weights
 
             return weights
 

@@ -28,8 +28,8 @@ Miner Data Methods, Extends the Bettensor Validator Class
 
 class MinerDataMixin:
     # Constants for validation
-    EPSILON = 1.0  # For historical validation
-    NEW_SUBMISSION_EPSILON = 0.01  # For new submissions
+    EPSILON = 5.0  # For historical validation, allowing larger differences
+    NEW_SUBMISSION_EPSILON = 0.01  # For new submissions, requiring closer matches
 
     def __init__(self, db_manager, metagraph, processed_uids):
         self.db_manager = db_manager

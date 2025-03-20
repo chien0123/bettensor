@@ -29,6 +29,7 @@ from bettensor.validator.utils.scoring.weights_functions import WeightSetter
 from bettensor.validator.utils.database.database_manager import DatabaseManager
 from bettensor.validator.utils.io.miner_data import MinerDataMixin
 from bettensor.validator.utils.io.bettensor_api_client import BettensorAPIClient
+from bettensor.validator.utils.scoring.min_stake import MinStakeService
 from bettensor.validator.utils.io.base_api_client import BaseAPIClient
 from bettensor.validator.utils.scoring.watchdog import Watchdog
 from bettensor import __spec_version__
@@ -100,6 +101,7 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
         self.scores = None
         self.hotkeys = None
         self.subtensor = None
+        self.min_stake_service = None
         self.axon_port = getattr(self.config, "axon.port", None)
         self.base_path = "./bettensor/validator/"
         self.max_targets = None
@@ -286,18 +288,25 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
         # Create a MinerDataMixin instance for the scoring system
         scoring_miner_data = MinerDataMixin(self.db_manager, self.metagraph, set(self.metagraph.uids))
 
+        # Initialize the MinStakeService
+        self.min_stake_service = MinStakeService(self.subtensor)
+
         # Initialize the scoring system with force_rebuild setting and miner_data
         self.scoring_system = ScoringSystem(
             self.db_manager,
             num_miners=256,
             max_days=45,
             current_date=datetime.now(timezone.utc),
-            force_rebuild=force_rebuild
+            force_rebuild=force_rebuild,
+            min_stake_service=self.min_stake_service
         )
         # Set the validator and miner_data attributes
         self.scoring_system.set_validator(self)
         self.scoring_system.miner_data = scoring_miner_data
         await self.scoring_system.initialize()
+
+        
+
 
         # After initialization, set force_rebuild_scores back to False to prevent future automatic rebuilds
         if force_rebuild:
