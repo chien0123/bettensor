@@ -42,7 +42,6 @@ class SportsData:
         self.api_client = api_client
         self.all_games = []
         self._last_processed_time = None
-        self._processed_game_ids = set()  # Track processed game IDs
 
     async def fetch_and_update_game_data(self, last_api_call):
         """Fetch and update game data with proper transaction and timeout handling"""
@@ -54,7 +53,7 @@ class SportsData:
                 bt.logging.info("Skipping update - last update was less than 5 minutes ago")
                 return []
 
-            # Get only games that need updates
+            # Get all games that need updates
             all_games = await self.api_client.fetch_all_game_data(last_api_call)
             bt.logging.info(f"Fetched {len(all_games)} games from API")
             
@@ -62,21 +61,12 @@ class SportsData:
                 self._last_processed_time = current_time
                 return []
 
-            # Filter out already processed games and group remaining ones
-            unprocessed_games = []
-            for game in all_games:
-                if not isinstance(game, dict) or 'externalId' not in game:
-                    continue
-                if game['externalId'] not in self._processed_game_ids:
-                    unprocessed_games.append(game)
+            # Filter out invalid games
+            valid_games = [game for game in all_games if isinstance(game, dict) and 'externalId' in game]
+            bt.logging.info(f"Found {len(valid_games)} valid games")
 
-            bt.logging.info(f"Found {len(unprocessed_games)} unprocessed games")
-            if not unprocessed_games:
-                self._last_processed_time = current_time
-                return []
-
-            # Group unprocessed games by date
-            games_by_date = self._group_games_by_date(unprocessed_games)
+            # Group games by date
+            games_by_date = self._group_games_by_date(valid_games)
             if not games_by_date:
                 self._last_processed_time = current_time
                 return []
@@ -92,8 +82,6 @@ class SportsData:
                 date_ids = await self._process_date_games(date_games)
                 if date_ids:
                     inserted_ids.extend(date_ids)
-                    # Track successfully processed games
-                    self._processed_game_ids.update(date_ids)
                     entropy_updates_needed.extend([g for g in date_games if g.get("externalId") in date_ids])
             
             # Process entropy updates in small batches with independent timeouts
@@ -103,11 +91,8 @@ class SportsData:
             # Update last processed time only if we had successful updates
             if inserted_ids:
                 self._last_processed_time = current_time
-                
-            # Periodically clean up old processed IDs to prevent memory growth
-            self._cleanup_processed_ids()
                         
-            self.all_games = [g for g in all_games if isinstance(g, dict)]
+            self.all_games = valid_games
             return inserted_ids
                 
         except Exception as e:
@@ -146,7 +131,6 @@ class SportsData:
         """Process all games for a specific date with chunking and retries"""
         inserted_ids = []
         
-        # First check which games actually need updates
         try:
             # Get current game states from database
             external_ids = [g.get("externalId") for g in date_games if isinstance(g, dict)]
@@ -156,7 +140,8 @@ class SportsData:
             # Use proper SQLAlchemy parameter binding for IN clause
             placeholders = ','.join([':id_' + str(i) for i in range(len(external_ids))])
             query = f"""
-                SELECT external_id, outcome, team_a_odds, team_b_odds, tie_odds, active
+                SELECT external_id, team_a, team_b, sport, league, event_start_date,
+                       active, outcome, team_a_odds, team_b_odds, tie_odds, can_tie
                 FROM game_data
                 WHERE external_id IN ({placeholders})
             """
@@ -170,13 +155,19 @@ class SportsData:
             existing_game_map = {}
             if existing_games:
                 for row in existing_games:
-                    existing_game_map[row['external_id']] = (
-                        row['outcome'],
-                        row['team_a_odds'],
-                        row['team_b_odds'],
-                        row['tie_odds'],
-                        row['active']
-                    )
+                    existing_game_map[row['external_id']] = {
+                        'team_a': row['team_a'],
+                        'team_b': row['team_b'],
+                        'sport': row['sport'],
+                        'league': row['league'],
+                        'event_start_date': row['event_start_date'],
+                        'active': row['active'],
+                        'outcome': row['outcome'],
+                        'team_a_odds': row['team_a_odds'],
+                        'team_b_odds': row['team_b_odds'],
+                        'tie_odds': row['tie_odds'],
+                        'can_tie': row['can_tie']
+                    }
             
             # Filter games that need updates
             games_needing_update = []
@@ -194,11 +185,18 @@ class SportsData:
                     existing = existing_game_map[external_id]
                     current_outcome = self._process_game_outcome(game)
                     
-                    # Check if any relevant fields have changed
-                    if (existing[0] != current_outcome or  # outcome changed
-                        abs(float(game.get("teamAOdds", 0)) - float(existing[1])) > 0.001 or  # odds changed
-                        abs(float(game.get("teamBOdds", 0)) - float(existing[2])) > 0.001 or
-                        abs(float(game.get("drawOdds", 0)) - float(existing[3])) > 0.001):
+                    # Check if any field has changed
+                    if (existing['outcome'] != current_outcome or
+                        existing['team_a'] != str(game.get("teamA", "")) or
+                        existing['team_b'] != str(game.get("teamB", "")) or
+                        existing['sport'] != str(game.get("sport", "")) or
+                        existing['league'] != str(game.get("league", "")) or
+                        existing['event_start_date'] != game.get("date", "") or
+                        existing['active'] != (1 if current_outcome == 3 or (datetime.now(timezone.utc) - datetime.fromisoformat(game.get("date", "").replace('Z', '+00:00'))) <= timedelta(hours=4) else 0) or
+                        abs(float(game.get("teamAOdds", 0)) - float(existing['team_a_odds'])) > 0.001 or
+                        abs(float(game.get("teamBOdds", 0)) - float(existing['team_b_odds'])) > 0.001 or
+                        abs(float(game.get("drawOdds", 0)) - float(existing['tie_odds'])) > 0.001 or
+                        existing['can_tie'] != (1 if game.get("canDraw", False) else 0)):
                         games_needing_update.append(game)
                 except (ValueError, TypeError, IndexError) as e:
                     bt.logging.error(f"Error processing game comparison for {game.get('externalId')}: {str(e)}")

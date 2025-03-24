@@ -198,3 +198,7 @@ entropy_system_state.json
 state_metadata.json
 state_hashes.txt
 bettensor/validator/state/*
+
+analyze_invalid_predictions.py
+metagraph.ipynb
+neurons.csv
