@@ -691,6 +691,15 @@ class ScoringSystem:
                             bt.logging.error(f"Failed to reset miner {miner_uid} after 3 attempts")
                             raise
                         time.sleep(1)  # Wait before retry
+            
+            #clear all miner scores from the arrays
+            self.composite_scores[miner_uid] = 0
+            self.clv_scores[miner_uid] = 0
+            self.roi_scores[miner_uid] = 0
+            self.sortino_scores[miner_uid] = 0
+            self.entropy_scores[miner_uid] = 0
+            self.amount_wagered[miner_uid] = 0
+            self.tiers[miner_uid] = 2 #reset to tier 1 (index 2)
                         
             bt.logging.info(f"Successfully reset all data for miner {miner_uid}")
                     
