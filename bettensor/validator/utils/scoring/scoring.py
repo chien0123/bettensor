@@ -647,6 +647,8 @@ class ScoringSystem:
         This is called when a hotkey changes UIDs or when a miner needs to be reset.
         """
         try:
+            bt.logging.info(f"Performing complete reset for miner {miner_uid}")
+            
             queries = [
                 # Clear all stats for the miner
                 ("""UPDATE miner_stats 
@@ -678,7 +680,21 @@ class ScoringSystem:
                 ("""DELETE FROM predictions 
                     WHERE miner_uid = ?""",
                  (miner_uid,)),
-                  
+                 
+                # Delete all scores for this miner
+                ("""DELETE FROM scores 
+                    WHERE miner_uid = ?""",
+                 (miner_uid,)),
+                 
+                # Delete entropy predictions for this miner
+                ("""DELETE FROM entropy_predictions 
+                    WHERE miner_uid = ?""",
+                 (miner_uid,)),
+                 
+                # Delete entropy miner scores for this miner
+                ("""DELETE FROM entropy_miner_scores 
+                    WHERE miner_uid = ?""",
+                 (miner_uid,)),
             ]
             
             for query, params in queries:
@@ -692,19 +708,30 @@ class ScoringSystem:
                             raise
                         time.sleep(1)  # Wait before retry
             
-            #clear all miner scores from the arrays
+            # Clear all in-memory data for this miner
             self.composite_scores[miner_uid] = 0
             self.clv_scores[miner_uid] = 0
             self.roi_scores[miner_uid] = 0
             self.sortino_scores[miner_uid] = 0
             self.entropy_scores[miner_uid] = 0
             self.amount_wagered[miner_uid] = 0
-            self.tiers[miner_uid] = 2 #reset to tier 1 (index 2)
+            self.tiers[miner_uid] = 1  # Reset to tier 1
+            
+            # Reset miner's data in the entropy system
+            if hasattr(self, 'entropy_system') and self.entropy_system:
+                # If entropy system has a reset_miner method, call it
+                if hasattr(self.entropy_system, 'reset_miner_data'):
+                    self.entropy_system.reset_miner_data(miner_uid)
+                # Otherwise, reset the miner's final entropy score directly
+                else:
+                    for day in range(self.max_days):
+                        self.entropy_system.final_scores[day][miner_uid] = 0.0
                         
             bt.logging.info(f"Successfully reset all data for miner {miner_uid}")
                     
         except Exception as e:
             bt.logging.error(f"Error resetting miner {miner_uid}: {str(e)}")
+            bt.logging.error(traceback.format_exc())
             raise
 
     def get_miner_history(self, miner_uid: int, score_type: str, days: int = None):

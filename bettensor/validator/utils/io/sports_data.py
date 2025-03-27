@@ -88,6 +88,9 @@ class SportsData:
             if entropy_updates_needed:
                 await self._process_entropy_updates_in_batches(entropy_updates_needed)
             
+            # Fix any games with null create_date or game_id
+            await self._fix_null_game_data()
+            
             # Update last processed time only if we had successful updates
             if inserted_ids:
                 self._last_processed_time = current_time
@@ -292,7 +295,7 @@ class SportsData:
                         continue
 
                     # Process game data and execute update
-                    params = self._prepare_game_params(game)
+                    params = await self._prepare_game_params(game)
                     if not params:
                         continue
 
@@ -319,7 +322,7 @@ class SportsData:
             bt.logging.error(f"Error in insert_or_update_games: {str(e)}")
             raise
 
-    def _prepare_game_params(self, game):
+    async def _prepare_game_params(self, game):
         """Prepare parameters for game insertion/update"""
         try:
             external_id = str(game.get("externalId"))
@@ -330,10 +333,12 @@ class SportsData:
             sport = str(game.get("sport", ""))
             league = str(game.get("league", ""))
             
-            # Handle dates
-            create_date = datetime.now(timezone.utc).isoformat()
-            last_update_date = datetime.now(timezone.utc).isoformat()
+            # Check if the game already exists in the database
+            existing_game = None
+            query = "SELECT game_id, create_date FROM game_data WHERE external_id = :external_id"
+            existing_game = await self.db_manager.fetch_one(query, {"external_id": external_id})
             
+            # Get event start date first for calculating create_date if needed
             event_start_date = game.get("date", "")
             if not event_start_date:
                 return None
@@ -341,13 +346,28 @@ class SportsData:
             event_start_time = datetime.fromisoformat(
                 event_start_date.replace('Z', '+00:00')
             ).replace(tzinfo=timezone.utc)
+            
+            # Handle dates
+            current_time = datetime.now(timezone.utc)
+            
+            # Use existing values if available, otherwise create new ones
+            game_id = existing_game["game_id"] if existing_game else str(uuid.uuid4())
+            
+            # For create_date, use existing or set to 1 week before event start
+            if existing_game and existing_game["create_date"]:
+                create_date = existing_game["create_date"]
+            else:
+                # Set create_date to 1 week before event start date
+                create_date = (event_start_time - timedelta(days=7)).isoformat()
+                
+            last_update_date = current_time.isoformat()
 
             # Handle outcome
             outcome = self._process_game_outcome(game)
             
             # Set active status
             active = 1
-            if outcome != 3 and (datetime.now(timezone.utc) - event_start_time) > timedelta(hours=4):
+            if outcome != 3 and (current_time - event_start_time) > timedelta(hours=4):
                 active = 0
 
             # Extract odds
@@ -358,7 +378,7 @@ class SportsData:
             can_tie = 1 if game.get("canDraw", False) else 0
 
             return {
-                "game_id": str(uuid.uuid4()),
+                "game_id": game_id,
                 "team_a": team_a,
                 "team_b": team_b,
                 "sport": sport,
@@ -407,13 +427,20 @@ class SportsData:
             :team_b_odds, :tie_odds, :can_tie
         )
         ON CONFLICT(external_id) DO UPDATE SET
+            game_id = COALESCE(game_data.game_id, excluded.game_id),
+            create_date = COALESCE(game_data.create_date, excluded.create_date),
+            team_a = excluded.team_a,
+            team_b = excluded.team_b,
+            sport = excluded.sport,
+            league = excluded.league,
             team_a_odds = excluded.team_a_odds,
             team_b_odds = excluded.team_b_odds,
             tie_odds = excluded.tie_odds,
             event_start_date = excluded.event_start_date,
             active = excluded.active,
             outcome = excluded.outcome,
-            last_update_date = excluded.last_update_date
+            last_update_date = excluded.last_update_date,
+            can_tie = excluded.can_tie
         """
 
     def prepare_game_data_for_entropy(self, games):
@@ -570,6 +597,79 @@ class SportsData:
         except Exception as e:
             bt.logging.error(f"Error in ensure_predictions_have_entropy_score: {e}")
             bt.logging.error(f"Traceback:\n{traceback.format_exc()}")
+
+    async def _fix_null_game_data(self):
+        """Check for and fix any games with null create_date or game_id values."""
+        try:
+            bt.logging.info("Checking for games with null critical fields...")
+            
+            # Find games with null create_date or game_id
+            query = """
+                SELECT external_id, game_id, create_date, event_start_date 
+                FROM game_data
+                WHERE create_date IS NULL OR game_id IS NULL
+            """
+            
+            null_games = await self.db_manager.fetch_all(query, {})
+            if not null_games:
+                bt.logging.info("No games found with null critical fields.")
+                return
+                
+            bt.logging.info(f"Found {len(null_games)} games with null critical fields. Fixing...")
+            
+            # Fix games using a transaction
+            async with self.db_manager.transaction() as session:
+                # Fix each game
+                current_time = datetime.now(timezone.utc).isoformat()
+                for game in null_games:
+                    external_id = game.get('external_id')
+                    if not external_id:
+                        continue
+                        
+                    # Generate values for null fields
+                    game_id = game.get('game_id')
+                    if not game_id:
+                        game_id = str(uuid.uuid4())
+                    
+                    # Calculate create_date as event_start_date minus 1 week if null
+                    create_date = game.get('create_date')
+                    if not create_date:
+                        event_start_date = game.get('event_start_date')
+                        if event_start_date:
+                            try:
+                                # Parse the event start date and subtract 1 week
+                                event_dt = datetime.fromisoformat(event_start_date.replace('Z', '+00:00'))
+                                create_dt = event_dt - timedelta(days=7)
+                                create_date = create_dt.isoformat()
+                            except (ValueError, AttributeError):
+                                # Fallback to current time if parsing fails
+                                create_date = current_time
+                        else:
+                            create_date = current_time
+                    
+                    # Update the record
+                    update_query = """
+                        UPDATE game_data
+                        SET game_id = :game_id, create_date = :create_date
+                        WHERE external_id = :external_id
+                    """
+                    
+                    await session.execute(
+                        text(update_query), 
+                        {
+                            "game_id": game_id,
+                            "create_date": create_date,
+                            "external_id": external_id
+                        }
+                    )
+                    
+                    bt.logging.debug(f"Fixed game with external_id: {external_id}")
+                
+            bt.logging.info(f"Successfully fixed {len(null_games)} games with null critical fields.")
+            
+        except Exception as e:
+            bt.logging.error(f"Error fixing null game data: {str(e)}")
+            bt.logging.error(traceback.format_exc())
 
 
 
