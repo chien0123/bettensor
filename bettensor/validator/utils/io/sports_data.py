@@ -1,7 +1,7 @@
 import os
 import json
 import time
-from typing import List
+from typing import List, Dict, Any
 import uuid
 import sqlite3
 import requests
@@ -90,6 +90,9 @@ class SportsData:
             
             # Fix any games with null create_date or game_id
             await self._fix_null_game_data()
+            
+            # Fix any miners with null hotkey/coldkey values
+            await self._fix_null_miner_keys()
             
             # Update last processed time only if we had successful updates
             if inserted_ids:
@@ -220,27 +223,48 @@ class SportsData:
             
         return inserted_ids
 
-    async def _process_game_chunk_with_retries(self, chunk):
-        """Process a single chunk of games with retries"""
-        retries = 0
-        while retries < self.MAX_RETRIES:
+    async def _process_game_chunk_with_retries(self, chunk: List[Dict[str, Any]], max_retries: int = 3) -> List[str]:
+        """Process a chunk of games with retries and transaction handling."""
+        for attempt in range(max_retries):
             try:
+                bt.logging.debug(f"Starting game chunk processing (attempt {attempt + 1}/{max_retries})")
+                bt.logging.debug(f"Chunk size: {len(chunk)} games")
+                
+                # Log the first game in the chunk for debugging
+                if chunk:
+                    bt.logging.debug(f"Sample game data: {chunk[0]}")
+                
                 async with async_timeout.timeout(self.TRANSACTION_TIMEOUT):
+                    bt.logging.debug(f"Transaction timeout set to {self.TRANSACTION_TIMEOUT} seconds")
                     async with self.db_manager.transaction() as session:
+                        bt.logging.debug("Transaction started")
                         chunk_ids = await self.insert_or_update_games(chunk, session)
-                        if chunk_ids:
-                            bt.logging.info(f"Successfully processed chunk of {len(chunk)} games")
-                            return chunk_ids
+                        bt.logging.debug(f"Transaction completed successfully. Processed {len(chunk_ids)} games")
+                        return chunk_ids
+                        
             except asyncio.TimeoutError:
-                bt.logging.warning(f"Timeout processing chunk (attempt {retries + 1})")
-                retries += 1
+                bt.logging.error(f"Transaction timeout on attempt {attempt + 1}")
+                if attempt == max_retries - 1:
+                    bt.logging.error("Max retries reached for transaction timeout")
+                    raise
+                await asyncio.sleep(1)
+                
+            except asyncio.CancelledError as e:
+                bt.logging.error(f"Transaction cancelled on attempt {attempt + 1}")
+                bt.logging.error(f"Cancellation context: {e.__context__}")
+                bt.logging.error(f"Cancellation traceback: {traceback.format_exc()}")
+                if attempt == max_retries - 1:
+                    bt.logging.error("Max retries reached for transaction cancellation")
+                    raise
+                await asyncio.sleep(1)
+                
             except Exception as e:
-                bt.logging.error(f"Error processing chunk: {str(e)}")
-                bt.logging.error(traceback.format_exc())
-                retries += 1
-        
-        bt.logging.error(f"Failed to process chunk after {self.MAX_RETRIES} attempts")
-        return []
+                bt.logging.error(f"Error processing game chunk on attempt {attempt + 1}: {str(e)}")
+                bt.logging.error(f"Error traceback: {traceback.format_exc()}")
+                if attempt == max_retries - 1:
+                    bt.logging.error("Max retries reached for general error")
+                    raise
+                await asyncio.sleep(1)
 
     async def _process_entropy_updates_in_batches(self, games):
         """Process entropy updates in very small batches with independent timeouts"""
@@ -322,82 +346,99 @@ class SportsData:
             bt.logging.error(f"Error in insert_or_update_games: {str(e)}")
             raise
 
-    async def _prepare_game_params(self, game):
-        """Prepare parameters for game insertion/update"""
+    async def _prepare_game_params(self, game: Dict[str, Any]) -> Dict[str, Any]:
+        """Prepare game parameters for database insertion."""
         try:
-            external_id = str(game.get("externalId"))
-            
-            # Extract required fields with defaults
-            team_a = str(game.get("teamA", ""))
-            team_b = str(game.get("teamB", ""))
-            sport = str(game.get("sport", ""))
-            league = str(game.get("league", ""))
-            
-            # Check if the game already exists in the database
-            existing_game = None
-            query = "SELECT game_id, create_date FROM game_data WHERE external_id = :external_id"
-            existing_game = await self.db_manager.fetch_one(query, {"external_id": external_id})
-            
-            # Get event start date first for calculating create_date if needed
-            event_start_date = game.get("date", "")
-            if not event_start_date:
-                return None
-                
-            event_start_time = datetime.fromisoformat(
-                event_start_date.replace('Z', '+00:00')
-            ).replace(tzinfo=timezone.utc)
-            
-            # Handle dates
-            current_time = datetime.now(timezone.utc)
-            
-            # Use existing values if available, otherwise create new ones
-            game_id = existing_game["game_id"] if existing_game else str(uuid.uuid4())
-            
-            # For create_date, use existing or set to 1 week before event start
-            if existing_game and existing_game["create_date"]:
-                create_date = existing_game["create_date"]
-            else:
-                # Set create_date to 1 week before event start date
-                create_date = (event_start_time - timedelta(days=7)).isoformat()
-                
-            last_update_date = current_time.isoformat()
-
-            # Handle outcome
-            outcome = self._process_game_outcome(game)
-            
-            # Set active status
-            active = 1
-            if outcome != 3 and (current_time - event_start_time) > timedelta(hours=4):
-                active = 0
-
-            # Extract odds
-            team_a_odds = float(game.get("teamAOdds", 0))
-            team_b_odds = float(game.get("teamBOdds", 0))
-            tie_odds = float(game.get("drawOdds", 0))
-            
-            can_tie = 1 if game.get("canDraw", False) else 0
-
-            return {
-                "game_id": game_id,
-                "team_a": team_a,
-                "team_b": team_b,
-                "sport": sport,
-                "league": league,
-                "external_id": external_id,
-                "create_date": create_date,
-                "last_update_date": last_update_date,
-                "event_start_date": event_start_time.isoformat(),
-                "active": active,
-                "outcome": outcome,
-                "team_a_odds": team_a_odds,
-                "team_b_odds": team_b_odds,
-                "tie_odds": tie_odds,
-                "can_tie": can_tie,
+            # Map API field names to database field names
+            field_mapping = {
+                'externalId': 'external_id',
+                'teamA': 'team_a',
+                'teamB': 'team_b',
+                'teamAOdds': 'team_a_odds',
+                'teamBOdds': 'team_b_odds',
+                'drawOdds': 'tie_odds',
+                'canDraw': 'can_tie',
+                'date': 'event_start_date'  # Handle both date and event_start_date
             }
-            
+
+            # Get event_start_date from either field
+            event_start_date = game.get('event_start_date') or game.get('date')
+            if not event_start_date:
+                bt.logging.error(f"Missing event_start_date/date in game data: {game}")
+                raise ValueError("Missing event start date in game data")
+
+            # Parse event_start_date if it's a string
+            if isinstance(event_start_date, str):
+                try:
+                    event_start_date = datetime.fromisoformat(event_start_date.replace('Z', '+00:00'))
+                except ValueError as e:
+                    bt.logging.error(f"Failed to parse event_start_date '{event_start_date}': {str(e)}")
+                    raise
+
+            # Calculate create_date as one week before event_start_date if not provided
+            create_date = game.get('create_date')
+            if not create_date:
+                try:
+                    create_date = event_start_date - timedelta(days=7)
+                    bt.logging.debug(f"Setting create_date to one week before event_start_date: {create_date}")
+                except Exception as e:
+                    bt.logging.error(f"Error calculating create_date: {str(e)}")
+                    bt.logging.error(f"event_start_date: {event_start_date}")
+                    bt.logging.error(f"event_start_date type: {type(event_start_date)}")
+                    raise
+
+            # Parse create_date if it's a string
+            if isinstance(create_date, str):
+                try:
+                    create_date = datetime.fromisoformat(create_date.replace('Z', '+00:00'))
+                except ValueError as e:
+                    bt.logging.error(f"Failed to parse create_date '{create_date}': {str(e)}")
+                    raise
+
+            # Ensure last_update_date is set
+            last_update_date = game.get('last_update_date')
+            if not last_update_date:
+                last_update_date = datetime.now(timezone.utc)
+                bt.logging.debug(f"Setting last_update_date to current time: {last_update_date}")
+
+            # Parse last_update_date if it's a string
+            if isinstance(last_update_date, str):
+                try:
+                    last_update_date = datetime.fromisoformat(last_update_date.replace('Z', '+00:00'))
+                except ValueError as e:
+                    bt.logging.error(f"Failed to parse last_update_date '{last_update_date}': {str(e)}")
+                    raise
+
+            # Map API fields to database fields with proper type handling
+            params = {
+                'external_id': str(game.get(field_mapping.get('externalId', 'external_id'), game.get('externalId', ''))),
+                'event_start_date': event_start_date,
+                'team_a': str(game.get(field_mapping.get('teamA', 'team_a'), game.get('teamA', ''))),
+                'team_b': str(game.get(field_mapping.get('teamB', 'team_b'), game.get('teamB', ''))),
+                'sport': str(game.get('sport', '')),
+                'league': str(game.get('league', '')),
+                'active': bool(game.get('active', True)),
+                'outcome': self._process_game_outcome(game),
+                'team_a_odds': float(game.get(field_mapping.get('teamAOdds', 'team_a_odds'), game.get('teamAOdds', 0.0))),
+                'team_b_odds': float(game.get(field_mapping.get('teamBOdds', 'team_b_odds'), game.get('teamBOdds', 0.0))),
+                'tie_odds': float(game.get(field_mapping.get('drawOdds', 'tie_odds'), game.get('drawOdds', 0.0))) if game.get('drawOdds') is not None else None,
+                'can_tie': bool(game.get(field_mapping.get('canDraw', 'can_tie'), game.get('canDraw', False))),
+                'create_date': create_date,
+                'last_update_date': last_update_date,
+                'model_config': game.get('model_config', {}),
+                'game_id': game.get('game_id', str(uuid.uuid4()))
+            }
+
+            # Log the prepared parameters for debugging
+            bt.logging.debug(f"Prepared game parameters: {params}")
+            return params
+
         except Exception as e:
             bt.logging.error(f"Error preparing game parameters: {str(e)}")
-            return None
+            bt.logging.error(f"Game data: {game}")
+            bt.logging.error(f"Error type: {type(e)}")
+            bt.logging.error(f"Error traceback: {traceback.format_exc()}")
+            raise
 
     def _process_game_outcome(self, game):
         """Process game outcome with validation"""
@@ -601,7 +642,7 @@ class SportsData:
     async def _fix_null_game_data(self):
         """Check for and fix any games with null create_date or game_id values."""
         try:
-            bt.logging.info("Checking for games with null critical fields...")
+            bt.logging.info("Starting null game data fix operation")
             
             # Find games with null create_date or game_id
             query = """
@@ -615,60 +656,157 @@ class SportsData:
                 bt.logging.info("No games found with null critical fields.")
                 return
                 
-            bt.logging.info(f"Found {len(null_games)} games with null critical fields. Fixing...")
+            bt.logging.info(f"Found {len(null_games)} games with null critical fields. Starting fix...")
             
             # Fix games using a transaction
-            async with self.db_manager.transaction() as session:
-                # Fix each game
-                current_time = datetime.now(timezone.utc).isoformat()
-                for game in null_games:
-                    external_id = game.get('external_id')
-                    if not external_id:
-                        continue
+            try:
+                async with self.db_manager.transaction() as session:
+                    bt.logging.debug("Transaction started for null game data fix")
+                    # Fix each game
+                    current_time = datetime.now(timezone.utc).isoformat()
+                    for game in null_games:
+                        external_id = game.get('external_id')
+                        if not external_id:
+                            continue
+                            
+                        # Generate values for null fields
+                        game_id = game.get('game_id')
+                        if not game_id:
+                            game_id = str(uuid.uuid4())
                         
-                    # Generate values for null fields
-                    game_id = game.get('game_id')
-                    if not game_id:
-                        game_id = str(uuid.uuid4())
-                    
-                    # Calculate create_date as event_start_date minus 1 week if null
-                    create_date = game.get('create_date')
-                    if not create_date:
-                        event_start_date = game.get('event_start_date')
-                        if event_start_date:
-                            try:
-                                # Parse the event start date and subtract 1 week
-                                event_dt = datetime.fromisoformat(event_start_date.replace('Z', '+00:00'))
-                                create_dt = event_dt - timedelta(days=7)
-                                create_date = create_dt.isoformat()
-                            except (ValueError, AttributeError):
-                                # Fallback to current time if parsing fails
+                        # Calculate create_date as event_start_date minus 1 week if null
+                        create_date = game.get('create_date')
+                        if not create_date:
+                            event_start_date = game.get('event_start_date')
+                            if event_start_date:
+                                try:
+                                    # Parse the event start date and subtract 1 week
+                                    event_dt = datetime.fromisoformat(event_start_date.replace('Z', '+00:00'))
+                                    create_dt = event_dt - timedelta(days=7)
+                                    create_date = create_dt.isoformat()
+                                except (ValueError, AttributeError):
+                                    # Fallback to current time if parsing fails
+                                    create_date = current_time
+                            else:
                                 create_date = current_time
-                        else:
-                            create_date = current_time
+                        
+                        # Update the record
+                        update_query = """
+                            UPDATE game_data
+                            SET game_id = :game_id, create_date = :create_date
+                            WHERE external_id = :external_id
+                        """
+                        
+                        await session.execute(
+                            text(update_query), 
+                            {
+                                "game_id": game_id,
+                                "create_date": create_date,
+                                "external_id": external_id
+                            }
+                        )
+                        
+                        bt.logging.debug(f"Fixed game with external_id: {external_id}")
                     
-                    # Update the record
-                    update_query = """
-                        UPDATE game_data
-                        SET game_id = :game_id, create_date = :create_date
-                        WHERE external_id = :external_id
-                    """
+                    bt.logging.debug("Transaction completed successfully for null game data fix")
                     
-                    await session.execute(
-                        text(update_query), 
-                        {
-                            "game_id": game_id,
-                            "create_date": create_date,
-                            "external_id": external_id
-                        }
-                    )
-                    
-                    bt.logging.debug(f"Fixed game with external_id: {external_id}")
+            except asyncio.CancelledError as e:
+                bt.logging.error("Transaction cancelled during null game data fix")
+                bt.logging.error(f"Cancellation context: {e.__context__}")
+                bt.logging.error(f"Cancellation traceback: {traceback.format_exc()}")
+                raise
                 
             bt.logging.info(f"Successfully fixed {len(null_games)} games with null critical fields.")
             
         except Exception as e:
             bt.logging.error(f"Error fixing null game data: {str(e)}")
+            bt.logging.error(traceback.format_exc())
+
+    async def _fix_null_miner_keys(self):
+        """Fix null hotkey/coldkey values in miner_stats by fetching current network state."""
+        try:
+            bt.logging.info("Starting null miner keys fix operation")
+            
+            # Find miners with null keys
+            query = """
+                SELECT miner_uid, miner_hotkey, miner_coldkey
+                FROM miner_stats
+                WHERE miner_hotkey IS NULL OR miner_coldkey IS NULL
+                AND miner_uid < 256
+            """
+            
+            null_miners = await self.db_manager.fetch_all(query, {})
+            if not null_miners:
+                bt.logging.info("No miners found with null hotkey/coldkey values.")
+                return
+                
+            bt.logging.info(f"Found {len(null_miners)} miners with null hotkey/coldkey values. Starting fix...")
+            
+            # Get current network state
+            try:
+                bt.logging.debug("Fetching current network state from subtensor")
+                # Get current network state from subtensor
+                subtensor = bt.subtensor()
+                neurons = subtensor.neurons()
+                
+                # Create mapping of UID to hotkey/coldkey
+                uid_to_keys = {}
+                for neuron in neurons:
+                    if hasattr(neuron, 'uid') and hasattr(neuron, 'hotkey') and hasattr(neuron, 'coldkey'):
+                        uid_to_keys[neuron.uid] = {
+                            'hotkey': neuron.hotkey,
+                            'coldkey': neuron.coldkey
+                        }
+                
+                bt.logging.info(f"Retrieved {len(uid_to_keys)} current network mappings")
+                
+                # Fix miners using a transaction
+                try:
+                    async with self.db_manager.transaction() as session:
+                        bt.logging.debug("Transaction started for null miner keys fix")
+                        for miner in null_miners:
+                            miner_uid = miner.get('miner_uid')
+                            if miner_uid not in uid_to_keys:
+                                bt.logging.warning(f"No current network mapping found for miner {miner_uid}")
+                                continue
+                                
+                            keys = uid_to_keys[miner_uid]
+                            
+                            # Update the record
+                            update_query = """
+                                UPDATE miner_stats
+                                SET miner_hotkey = :hotkey,
+                                    miner_coldkey = :coldkey
+                                WHERE miner_uid = :miner_uid
+                            """
+                            
+                            await session.execute(
+                                text(update_query), 
+                                {
+                                    "hotkey": keys['hotkey'],
+                                    "coldkey": keys['coldkey'],
+                                    "miner_uid": miner_uid
+                                }
+                            )
+                            
+                            bt.logging.debug(f"Fixed keys for miner {miner_uid}")
+                        
+                        bt.logging.debug("Transaction completed successfully for null miner keys fix")
+                        
+                except asyncio.CancelledError as e:
+                    bt.logging.error("Transaction cancelled during null miner keys fix")
+                    bt.logging.error(f"Cancellation context: {e.__context__}")
+                    bt.logging.error(f"Cancellation traceback: {traceback.format_exc()}")
+                    raise
+                
+                bt.logging.info(f"Successfully fixed {len(null_miners)} miners with null hotkey/coldkey values.")
+                
+            except Exception as e:
+                bt.logging.error(f"Error fetching network state: {str(e)}")
+                bt.logging.error(traceback.format_exc())
+            
+        except Exception as e:
+            bt.logging.error(f"Error fixing null miner keys: {str(e)}")
             bt.logging.error(traceback.format_exc())
 
 

@@ -727,6 +727,35 @@ class ScoringSystem:
                     for day in range(self.max_days):
                         self.entropy_system.final_scores[day][miner_uid] = 0.0
                         
+            # Initialize fresh miner stats for just this miner
+            if self.scoring_data:
+                # First ensure the row exists
+                await self.db_manager.execute_query(
+                    "INSERT OR IGNORE INTO miner_stats (miner_uid) VALUES (?)",
+                    (miner_uid,)
+                )
+                # Then update with default values
+                await self.db_manager.execute_query(
+                    """UPDATE miner_stats 
+                       SET miner_current_tier = 1,
+                           miner_current_scoring_window = 0,
+                           miner_current_composite_score = 0,
+                           miner_current_sharpe_ratio = 0,
+                           miner_current_sortino_ratio = 0,
+                           miner_current_roi = 0,
+                           miner_current_clv_avg = 0,
+                           miner_lifetime_earnings = 0,
+                           miner_lifetime_wager_amount = 0,
+                           miner_lifetime_roi = 0,
+                           miner_lifetime_predictions = 0,
+                           miner_lifetime_wins = 0,
+                           miner_lifetime_losses = 0,
+                           miner_win_loss_ratio = 0
+                       WHERE miner_uid = ?""",
+                    (miner_uid,)
+                )
+                bt.logging.info(f"Re-initialized miner stats for miner {miner_uid}")
+                        
             bt.logging.info(f"Successfully reset all data for miner {miner_uid}")
                     
         except Exception as e:

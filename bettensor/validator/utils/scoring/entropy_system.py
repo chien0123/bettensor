@@ -50,6 +50,10 @@ class EntropySystem:
         self.game_close_times = {}
         self.db_manager = db_manager  # Store db_manager reference
 
+        # Initialize final_scores and daily_contributions
+        self.final_scores = defaultdict(lambda: defaultdict(float))
+        self.daily_contributions = defaultdict(lambda: defaultdict(float))
+
         # Add tracking for changes since last save
         self._changes_since_save = {
             'new_predictions': set(),  # Set of (game_id, outcome, prediction_id)
