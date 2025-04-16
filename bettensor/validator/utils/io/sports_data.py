@@ -94,9 +94,10 @@ class SportsData:
             # Fix any miners with null hotkey/coldkey values
             await self._fix_null_miner_keys()
             
-            # Update last processed time only if we had successful updates
-            if inserted_ids:
-                self._last_processed_time = current_time
+            # Update last processed time AFTER all processing steps are done
+            # This ensures the cooldown applies even if no games were inserted/updated
+            # but the API call and processing steps were completed.
+            self._last_processed_time = current_time
                         
             self.all_games = valid_games
             return inserted_ids
@@ -104,6 +105,7 @@ class SportsData:
         except Exception as e:
             bt.logging.error(f"Error in game data update: {str(e)}")
             bt.logging.error(traceback.format_exc())
+            # Do not update _last_processed_time on error to allow immediate retry
             return []
 
     def _cleanup_processed_ids(self):
@@ -134,91 +136,27 @@ class SportsData:
         return games_by_date
 
     async def _process_date_games(self, date_games):
-        """Process all games for a specific date with chunking and retries"""
+        """Process games for a specific date, handling insertion or update via UPSERT."""
         inserted_ids = []
-        
         try:
-            # Get current game states from database
-            external_ids = [g.get("externalId") for g in date_games if isinstance(g, dict)]
-            if not external_ids:
-                return []
+            bt.logging.info(f"Processing {len(date_games)} games received from API for date")
 
-            # Use proper SQLAlchemy parameter binding for IN clause
-            placeholders = ','.join([':id_' + str(i) for i in range(len(external_ids))])
-            query = f"""
-                SELECT external_id, team_a, team_b, sport, league, event_start_date,
-                       active, outcome, team_a_odds, team_b_odds, tie_odds, can_tie
-                FROM game_data
-                WHERE external_id IN ({placeholders})
-            """
-            
-            # Create parameters dict with numbered placeholders
-            params = {f'id_{i}': external_id for i, external_id in enumerate(external_ids)}
-            
-            existing_games = await self.db_manager.fetch_all(query, params)
-            
-            # Create mapping of existing games using column names
-            existing_game_map = {}
-            if existing_games:
-                for row in existing_games:
-                    existing_game_map[row['external_id']] = {
-                        'team_a': row['team_a'],
-                        'team_b': row['team_b'],
-                        'sport': row['sport'],
-                        'league': row['league'],
-                        'event_start_date': row['event_start_date'],
-                        'active': row['active'],
-                        'outcome': row['outcome'],
-                        'team_a_odds': row['team_a_odds'],
-                        'team_b_odds': row['team_b_odds'],
-                        'tie_odds': row['tie_odds'],
-                        'can_tie': row['can_tie']
-                    }
-            
-            # Filter games that need updates
-            games_needing_update = []
-            for game in date_games:
-                try:
-                    external_id = game.get("externalId")
-                    if not external_id:
-                        continue
-                        
-                    if external_id not in existing_game_map:
-                        # New game
-                        games_needing_update.append(game)
-                        continue
-                        
-                    existing = existing_game_map[external_id]
-                    current_outcome = self._process_game_outcome(game)
-                    
-                    # Check if any field has changed
-                    if (existing['outcome'] != current_outcome or
-                        existing['team_a'] != str(game.get("teamA", "")) or
-                        existing['team_b'] != str(game.get("teamB", "")) or
-                        existing['sport'] != str(game.get("sport", "")) or
-                        existing['league'] != str(game.get("league", "")) or
-                        existing['event_start_date'] != game.get("date", "") or
-                        existing['active'] != (1 if current_outcome == 3 or (datetime.now(timezone.utc) - datetime.fromisoformat(game.get("date", "").replace('Z', '+00:00'))) <= timedelta(hours=4) else 0) or
-                        abs(float(game.get("teamAOdds", 0)) - float(existing['team_a_odds'])) > 0.001 or
-                        abs(float(game.get("teamBOdds", 0)) - float(existing['team_b_odds'])) > 0.001 or
-                        abs(float(game.get("drawOdds", 0)) - float(existing['tie_odds'])) > 0.001 or
-                        existing['can_tie'] != (1 if game.get("canDraw", False) else 0)):
-                        games_needing_update.append(game)
-                except (ValueError, TypeError, IndexError) as e:
-                    bt.logging.error(f"Error processing game comparison for {game.get('externalId')}: {str(e)}")
-                    continue
-            
-            bt.logging.info(f"Found {len(games_needing_update)} games needing updates out of {len(date_games)} total")
-            
-            # Process games that need updates in chunks
-            for i in range(0, len(games_needing_update), self.CHUNK_SIZE):
-                chunk = games_needing_update[i:i + self.CHUNK_SIZE]
+            # Filter games for basic validity (must have externalId)
+            valid_games = [game for game in date_games if isinstance(game, dict) and game.get("externalId")]
+            bt.logging.info(f"Processing {len(valid_games)} valid games after filtering")
+
+            # Process valid games in chunks using UPSERT logic
+            for i in range(0, len(valid_games), self.CHUNK_SIZE):
+                chunk = valid_games[i:i + self.CHUNK_SIZE]
+                # _process_game_chunk_with_retries will call insert_or_update_games,
+                # which uses the UPSERT query, eliminating the need for pre-fetching.
                 chunk_ids = await self._process_game_chunk_with_retries(chunk)
                 if chunk_ids:
                     inserted_ids.extend(chunk_ids)
                     
         except Exception as e:
-            bt.logging.error(f"Error checking for game updates: {str(e)}")
+            # Adjusted log message for clarity
+            bt.logging.error(f"Error processing games batch for date: {str(e)}") 
             bt.logging.error(traceback.format_exc())
             
         return inserted_ids
@@ -267,38 +205,51 @@ class SportsData:
                 await asyncio.sleep(1)
 
     async def _process_entropy_updates_in_batches(self, games):
-        """Process entropy updates in very small batches with independent timeouts"""
+        """Process entropy updates in very small batches, saving state once at the end."""
+        processed_count = 0
+        total_batches = (len(games) + self.ENTROPY_BATCH_SIZE - 1) // self.ENTROPY_BATCH_SIZE
+        
         for i in range(0, len(games), self.ENTROPY_BATCH_SIZE):
             batch = games[i:i + self.ENTROPY_BATCH_SIZE]
+            batch_num = i // self.ENTROPY_BATCH_SIZE + 1
             
-            # First update entropy system (memory operations)
+            # Update entropy system (memory operations)
             try:
                 game_data = self.prepare_game_data_for_entropy(batch)
+                if not game_data:
+                    continue
+                
                 for game in game_data:
                     await self.entropy_system.add_new_game(
                         game["id"], 
                         len(game["current_odds"]), 
                         game["current_odds"]
                     )
-                bt.logging.debug(f"Added batch {i//self.ENTROPY_BATCH_SIZE + 1} to entropy system")
+                processed_count += len(game_data)
+                bt.logging.debug(f"Added batch {batch_num}/{total_batches} ({len(game_data)} games) to entropy system")
             except Exception as e:
-                bt.logging.error(f"Error updating entropy system for batch {i//self.ENTROPY_BATCH_SIZE + 1}: {str(e)}")
+                bt.logging.error(f"Error updating entropy system for batch {batch_num}/{total_batches}: {str(e)}")
                 continue
-            
-            # Then try to save state with retries
+        
+        # Save state once after processing all batches
+        if processed_count > 0:
+            bt.logging.info(f"Attempting to save entropy state after processing {processed_count} games")
             retries = 0
             while retries < self.MAX_RETRIES:
                 try:
                     # Use a separate long-running session for entropy state save
                     async with self.db_manager.get_long_running_session() as session:
                         await self.entropy_system.save_state()
-                        bt.logging.debug(f"Saved entropy state for batch {i//self.ENTROPY_BATCH_SIZE + 1}")
+                        bt.logging.info(f"Successfully saved entropy state.")
                         break
                 except Exception as e:
-                    bt.logging.error(f"Error saving entropy state (attempt {retries + 1}): {str(e)}")
+                    bt.logging.error(f"Error saving entropy state (attempt {retries + 1}/{self.MAX_RETRIES}): {str(e)}")
                     retries += 1
                     if retries == self.MAX_RETRIES:
                         bt.logging.error("Failed to save entropy state after max retries")
+                    await asyncio.sleep(1) # Wait before retrying
+        else:
+            bt.logging.info("No games processed for entropy, skipping state save.")
 
     async def insert_or_update_games(self, games, session):
         """Insert or update games in the database using the provided session"""

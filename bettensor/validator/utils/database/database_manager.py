@@ -95,10 +95,10 @@ class DatabaseManager:
             
             # Get connection first with timeout
             try:
-                async with async_timeout.timeout(5):
+                async with async_timeout.timeout(60):  # Increased from 5s
                     connection = await self._acquire_connection()
             except asyncio.TimeoutError:
-                bt.logging.error("Connection acquisition timed out")
+                bt.logging.error("Connection acquisition timed out after 60s")
                 raise
             
             # Create session with acquired connection
@@ -221,9 +221,10 @@ class DatabaseManager:
                     f"sqlite+aiosqlite:///{self.db_path}",
                     echo=False,
                     pool_pre_ping=True,
-                    pool_size=10,
-                    max_overflow=20,
-                    pool_recycle=3600
+                    pool_size=10,  # Keep existing pool size
+                    max_overflow=20, # Keep existing overflow
+                    pool_recycle=3600,
+                    pool_timeout=60  # Explicitly set pool timeout to 60s
                 )
 
             connection = await self.engine.connect()
