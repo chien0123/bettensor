@@ -112,17 +112,27 @@ class ScoringData:
         return structured_predictions, closing_line_odds, results
 
     async def _fetch_closed_game_data(self, date_str):
-        """Fetch closed game data for a specific date."""
+        """Fetch closed game data started within the 48 hours preceding the end of the specified date."""
         try:
-            # Parse the input date
-            target_date = datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S')
-            
-            # Format start and end dates
-            formatted_start = target_date.replace(hour=0, minute=0, second=0).isoformat()
-            formatted_end = target_date.replace(hour=23, minute=59, second=59).isoformat()
-            
+            # Parse the input date string, assuming it represents the start of the day
+            target_start_dt_naive = datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S')
+            # Make it timezone-aware (UTC)
+            target_start_dt_utc = target_start_dt_naive.replace(tzinfo=timezone.utc)
+
+            # Calculate the end of the target day in UTC
+            target_end_dt_utc = target_start_dt_utc.replace(hour=23, minute=59, second=59)
+
+            # Calculate the start of the 48-hour window (48 hours before the end of the target day)
+            window_start_dt_utc = target_end_dt_utc - timedelta(hours=48)
+
+            # Format timestamps into ISO 8601 strings with UTC offset for SQLite TEXT comparison
+            formatted_start_iso = window_start_dt_utc.isoformat(timespec='seconds')
+            formatted_end_iso = target_end_dt_utc.isoformat(timespec='seconds')
+
+            bt.logging.debug(f"Fetching closed game data started between: {formatted_start_iso} and {formatted_end_iso}")
+
             query = """
-                SELECT 
+                SELECT
                     external_id,
                     event_start_date,
                     team_a_odds,
@@ -130,42 +140,47 @@ class ScoringData:
                     tie_odds,
                     outcome
                 FROM game_data
-                WHERE event_start_date BETWEEN :start_date AND :end_date
+                WHERE event_start_date BETWEEN :start_iso AND :end_iso
                 AND outcome IS NOT NULL
                 AND outcome != 'Unfinished'
                 AND outcome != 3
                 ORDER BY event_start_date ASC
             """
-            
+
             params = {
-                "start_date": formatted_start,
-                "end_date": formatted_end
+                "start_iso": formatted_start_iso,
+                "end_iso": formatted_end_iso
             }
-            
+
             games = await self.db_manager.fetch_all(query, params)
-            
+
             if not games:
-                bt.logging.warning(f"No closed games found for date {date_str}")
+                bt.logging.warning(f"No closed games found starting within the 48hr window ending {formatted_end_iso}")
                 return np.array([])
-            
+
             # Process the games to combine odds into the expected format
             processed_games = []
             for game in games:
+                # Ensure odds are floats, handle None for tie_odds
+                team_a_odds = float(game['team_a_odds']) if game['team_a_odds'] is not None else 0.0
+                team_b_odds = float(game['team_b_odds']) if game['team_b_odds'] is not None else 0.0
+                tie_odds = float(game['tie_odds']) if game['tie_odds'] is not None else 0.0 # Use 0.0 if None
+
                 processed_game = {
                     'external_id': game['external_id'],
                     'event_start_date': game['event_start_date'],
                     'closing_line_odds': [
-                        game['team_a_odds'],
-                        game['team_b_odds'],
-                        game['tie_odds'] if game['tie_odds'] is not None else float('inf')
+                        team_a_odds,
+                        team_b_odds,
+                        tie_odds # Keep tie odds as potentially 0.0 if None/not applicable
                     ],
                     'outcome': game['outcome']
                 }
                 processed_games.append(processed_game)
-            
-            bt.logging.info(f"Found {len(processed_games)} closed games for date {date_str}")
+
+            bt.logging.info(f"Found {len(processed_games)} closed games started within the 48hr window ending {formatted_end_iso}")
             return np.array(processed_games)
-            
+
         except Exception as e:
             bt.logging.error(f"Error fetching closed game data: {e}")
             bt.logging.error(traceback.format_exc())

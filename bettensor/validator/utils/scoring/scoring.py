@@ -502,7 +502,14 @@ class ScoringSystem:
             # Set invalid UIDs to tier 0
             self.tiers[list(invalid_uids), self.current_day] = 0
 
-            bt.logging.info(f"Current tiers after management: {np.bincount(current_tiers, minlength=self.num_tiers)}")
+            # Log the final state AFTER invalid UIDs are set to tier 0
+            final_tier_counts_bincount = np.bincount(self.tiers[:, self.current_day], minlength=self.num_tiers)
+            bt.logging.info(f"Current tiers after management (incl. invalid): {final_tier_counts_bincount}")
+            
+            # Optional: Log distribution excluding Tier 0 if desired
+            final_tier_counts_dist = [int(np.sum(self.tiers[:, self.current_day] == t)) for t in range(1, self.num_tiers)]
+            bt.logging.info(f"Final tier distribution (Tiers 1+): {final_tier_counts_dist}")
+            
             bt.logging.info("Tier management completed")
 
         except Exception as e:
@@ -527,7 +534,8 @@ class ScoringSystem:
                 if self._meets_tier_requirements(miner, tier) and miner in valid_uids
             ]
             bt.logging.debug(
-                f"Tier {tier-1}: {len(eligible_miners)} eligible miners for {open_slots} openslots"
+                # Corrected log message to reflect the tier being checked for promotions *into*
+                f"Checking eligibility for Tier {tier}: {len(eligible_miners)} miners in lower tiers eligible for {open_slots} open slots"
             )
 
             # Sort eligible miners by composite scores descending
@@ -989,7 +997,8 @@ class ScoringSystem:
                     tier_min = weights[tier_miners].min()
                     tier_max = weights[tier_miners].max()
                     tier_spread = tier_max - tier_min
-                    bt.logging.info(f"Tier {tier-1} distribution:")
+                    # Corrected log to use the actual tier number
+                    bt.logging.info(f"Tier {tier} distribution:") 
                     bt.logging.info(f"  Weight range: {tier_min:.6f} - {tier_max:.6f}")
                     bt.logging.info(f"  Weight spread: {tier_spread:.6f}")
                     bt.logging.info(f"  Total weight: {tier_sum:.4f}")
