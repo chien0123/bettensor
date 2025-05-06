@@ -195,9 +195,9 @@ async def game_data_update_loop(validator):
                         # Deep update on startup or every 6 hours
                         if first_run or (current_time_secs - last_deep_update >= DEEP_UPDATE_INTERVAL):
                             bt.logging.info("Performing deep game data update...")
-                            deep_update_time = current_time - timedelta(days=7)
+                            deep_update_time = current_time - timedelta(days=45)
                             async with async_timeout.timeout(max(current_timeout * 2, max_timeout)):  # Double timeout for deep updates
-                                await asyncio.shield(update_game_data(validator, deep_update_time))
+                                await asyncio.shield(update_game_data(validator, deep_update_time, deep_query=True))
                             last_deep_update = current_time_secs
                             validator.last_api_call = deep_update_time
                             await validator.save_state()
@@ -207,9 +207,7 @@ async def game_data_update_loop(validator):
                         
                         # Regular update
                         async with async_timeout.timeout(current_timeout):
-                            await asyncio.shield(update_game_data(validator, current_time))
-                            validator.last_api_call = current_time
-                            await validator.save_state()
+                            await asyncio.shield(update_game_data(validator, current_time, deep_query=False))
                             
                         # Successful update - reduce timeout back towards base
                         current_timeout = max(base_timeout, current_timeout / timeout_backoff)
@@ -581,46 +579,73 @@ async def log_status_with_watchdog(validator):
 
 @time_task("update_game_data")
 @cancellable_task
-async def update_game_data(validator, current_time, deep_query=False):
+async def update_game_data(validator, reference_time_for_query, deep_query=False):
     """
     Calls SportsData to update game data in the database with dynamic timeouts
     """
     bt.logging.info("\n--------------------------------Updating game data--------------------------------\n")
     
     try:
+        actual_current_time = datetime.now(timezone.utc) # The true 'now'
+        query_start_time_for_api: datetime
+        log_prefix: str
+
+        if deep_query:
+            # For deep query, reference_time_for_query is the start of the lookback (e.g., now - 45 days passed from caller).
+            # This will be the LastUpdateDate for the API call.
+            query_start_time_for_api = reference_time_for_query
+            query_end_time_for_log = actual_current_time
+            log_prefix = "Deep query"
+        else:
+            # For regular query, reference_time_for_query is the actual current time when the caller decided to run this.
+            # query_start_time_for_api will be validator.last_api_call.
+            query_start_time_for_api = validator.last_api_call
+            query_end_time_for_log = reference_time_for_query 
+            log_prefix = "Regular query"
+
+        bt.logging.info(f"{log_prefix} from {query_start_time_for_api} to {query_end_time_for_log}")
+
         async with async_timeout.timeout(GAME_DATA_TIMEOUT):
             current_timeout = DATABASE_MIN_TIMEOUT
             max_retries = 3
             
+            all_games = None # Initialize all_games
             for attempt in range(max_retries):
                 try:
                     bt.logging.debug(f"Database operation attempt {attempt + 1} with timeout {current_timeout}s")
                     async with async_timeout.timeout(current_timeout):
                         if not await validator.db_manager.ensure_connection():
                             bt.logging.error("Failed to establish database connection")
-                            return
+                            return # Return None or raise an error if connection fails
                         
-                        api_call_time = current_time
-                        query_time = current_time - timedelta(days=2) if deep_query else validator.last_api_call
+                        # query_start_time_for_api is passed as LastUpdateDate to fetch_all_game_data
+                        all_games = await validator.sports_data.fetch_and_update_game_data(query_start_time_for_api)
                         
-                        bt.logging.info(f"{'Deep query' if deep_query else 'Regular query'} from {query_time} to {current_time}")
-                        all_games = await validator.sports_data.fetch_and_update_game_data(query_time)
+                        if all_games == []:
+                            # This case specifically catches when sports_data.fetch_and_update_game_data returns []
+                            # due to its internal 5-minute cooldown.
+                            bt.logging.info(f"{log_prefix} was skipped by SportsData's internal 5-minute cooldown (no API call made by SportsData).")
+                        elif all_games is not None: # Succeeded and fetched some data, or no data was available from API but API call was made
+                            bt.logging.info(f"{log_prefix} completed. Fetched {len(all_games)} items from API via SportsData.")
+                            if deep_query:
+                                validator.last_api_call = actual_current_time
+                            else: # Regular query
+                                validator.last_api_call = reference_time_for_query # This is the actual_current_time from the caller for regular updates
+                            await validator.save_state()
+                        else: # all_games is None, implies an error from sports_data not caught by its own try/except that returns []
+                            bt.logging.error(f"{log_prefix} failed: SportsData.fetch_and_update_game_data returned None.")
                         
                         # Success - reduce timeout for next time
                         current_timeout = max(DATABASE_MIN_TIMEOUT, current_timeout * DATABASE_TIMEOUT_REDUCTION)
-                        break
+                        break # Exit retry loop on success
                         
                 except asyncio.TimeoutError:
-                    bt.logging.warning(f"Database operation timed out after {current_timeout}s")
+                    bt.logging.warning(f"Database operation timed out after {current_timeout}s on attempt {attempt + 1}")
                     current_timeout = min(DATABASE_MAX_TIMEOUT, current_timeout * DATABASE_TIMEOUT_BACKOFF)
                     if attempt == max_retries - 1:
-                        raise
-                    continue
-            
-            # Only update last_api_call for regular queries
-            if not deep_query:
-                validator.last_api_call = api_call_time
-                await validator.save_state()
+                        bt.logging.error("Max retries reached for database operation timeout during game data update.")
+                        raise # Re-raise the timeout error if max retries are reached
+                    continue # Continue to next retry attempt
             
             return all_games
             

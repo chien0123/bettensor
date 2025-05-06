@@ -397,13 +397,18 @@ class SportsData:
         if outcome is None or outcome == "Unfinished":
             return 3
         elif isinstance(outcome, str):
-            return (
-                0 if outcome == "TeamAWin" else
-                1 if outcome == "TeamBWin" else
-                2 if outcome == "Draw" else
-                3  # Default to Unfinished for unknown strings
-            )
-        return 3
+            if outcome == "TeamAWin":
+                return 0
+            elif outcome == "TeamBWin":
+                return 1
+            elif outcome == "Draw":
+                return 2
+            else:
+                bt.logging.warning(f"Unexpected game outcome string received from API for game {game.get('externalId', 'Unknown_ID')}: '{outcome}'. Defaulting to Unfinished (3).")
+                return 3  # Default to Unfinished for unknown strings
+        else:
+            bt.logging.warning(f"Unexpected game outcome type received from API for game {game.get('externalId', 'Unknown_ID')}: '{type(outcome)}'. Defaulting to Unfinished (3).")
+            return 3  # Default to Unfinished for unknown types
 
     def _get_upsert_query(self):
         """Get the SQL query for upserting game data"""

@@ -33,7 +33,7 @@ class BettensorAPIClient(BaseAPIClient):
         """
         if last_update_date is None:
             # set to 1 week ago
-            last_update_date = datetime.now(timezone.utc) - timedelta(days=15)
+            last_update_date = datetime.now(timezone.utc) - timedelta(days=45)
 
         # Fetch the games from the API
         bt.logging.info(f"Fetching games from API with last update date: {last_update_date}")
@@ -49,8 +49,8 @@ class BettensorAPIClient(BaseAPIClient):
         all_games = []
         page_index = 0
         start_date = (
-            datetime.now(timezone.utc) - timedelta(days=15)
-        ).isoformat()  # 15 days ago
+            datetime.now(timezone.utc) - timedelta(days=45)
+        ).isoformat()  # 45 days ago
 
         while True:
             # Add await here
