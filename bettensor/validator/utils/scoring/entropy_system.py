@@ -1050,41 +1050,41 @@ class EntropySystem:
         self._delta_predictions = {}
 
     def reset_miner_data(self, miner_uid: int):
-        """
-        Reset all entropy-related data for a specific miner.
-        Called when a miner is deregistered or when its hotkey changes.
-        
-        Args:
-            miner_uid (int): The UID of the miner to reset
-        """
+        """Reset all data related to a specific miner, including their predictions and scores."""
         bt.logging.info(f"Resetting entropy data for miner {miner_uid}")
-        
+
+        # Remove miner's predictions from game pools
+        for game_id, outcomes in list(self.game_pools.items()):
+            for outcome, pool_data in list(outcomes.items()):
+                new_predictions = []
+                removed_count = 0
+                for pred in pool_data["predictions"]:
+                    if pred["miner_uid"] != miner_uid:
+                        new_predictions.append(pred)
+                    else:
+                        removed_count +=1
+                
+                if removed_count > 0:
+                    pool_data["predictions"] = new_predictions
+                    # Only recalculate if there are still predictions
+                    if pool_data["predictions"]:
+                        # TODO: Replace 0.5 with actual initial_odds if available for this pool
+                        pool_data["entropy_score"] = self.calculate_initial_entropy(0.5)
+                    else:
+                        pool_data["entropy_score"] = 0.0
+
+                    self._changes_since_save['updated_pools'].add((game_id, outcome))
+
+        # Remove miner's entries from miner_predictions
+        for day in self.miner_predictions:
+            if miner_uid in self.miner_predictions[day]:
+                del self.miner_predictions[day][miner_uid]
+
         # Reset final scores for this miner across all days
         for day in range(self.max_days):
             self.final_scores[day][miner_uid] = 0.0
             
-        # Reset the miner's predictions from all game pools
-        predictions_removed = 0
-        for game_id, outcomes in self.game_pools.items():
-            for outcome, pool in outcomes.items():
-                # Filter out this miner's predictions
-                miner_predictions = [p for p in pool["predictions"] if p["miner_uid"] == miner_uid]
-                predictions_removed += len(miner_predictions)
-                
-                # Remove this miner's predictions
-                pool["predictions"] = [p for p in pool["predictions"] if p["miner_uid"] != miner_uid]
-                
-                # Recalculate entropy score if predictions were removed
-                if miner_predictions:
-                    # Only recalculate if there are still predictions
-                    if pool["predictions"]:
-                        self._calculate_pool_entropy(pool)
-                    else:
-                        pool["entropy_score"] = 0.0
-        
-        bt.logging.info(f"Removed {predictions_removed} entropy predictions for miner {miner_uid}")
-        
-        # Reset miner's contribution totals
+        # Reset the miner's contributions totals
         for day in range(self.max_days):
             if miner_uid in self.daily_contributions[day]:
                 self.daily_contributions[day][miner_uid] = 0.0

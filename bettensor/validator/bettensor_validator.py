@@ -325,6 +325,7 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
             db_manager=self.db_manager,
             api_client=self.api_client,
             entropy_system=self.scoring_system.entropy_system,
+            netuid=self.config.netuid,
         )
 
         self.weight_setter = WeightSetter(

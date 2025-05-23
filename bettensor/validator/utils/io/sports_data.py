@@ -36,10 +36,12 @@ class SportsData:
         db_manager: DatabaseManager,
         entropy_system: EntropySystem,
         api_client,
+        netuid: int,
     ):
         self.db_manager = db_manager
         self.entropy_system = entropy_system
         self.api_client = api_client
+        self.netuid = netuid
         self.all_games = []
         self._last_processed_time = None
 
@@ -703,7 +705,7 @@ class SportsData:
                 bt.logging.debug("Fetching current network state from subtensor")
                 # Get current network state from subtensor
                 subtensor = bt.subtensor()
-                neurons = subtensor.neurons()
+                neurons = subtensor.neurons(netuid=self.netuid)
                 
                 # Create mapping of UID to hotkey/coldkey
                 uid_to_keys = {}
