@@ -982,9 +982,6 @@ class MinerDataMixin:
                                         predictions_to_delete.append(prediction_id)
                                         continue
                                 
-                                # Update running total since this prediction will be valid
-                                current_total += wager
-                                
                                 # Add to valid predictions
                                 valid_predictions.append(prediction)
                                     
